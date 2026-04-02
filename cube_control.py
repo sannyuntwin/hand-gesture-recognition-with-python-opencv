@@ -13,6 +13,10 @@ import mediapipe as mp    # MediaPipe for hand tracking and landmarks
 import numpy as np        # For array operations
 import math               # Math functions for calculations
 
+CAMERA_WIDTH = 1280
+CAMERA_HEIGHT = 720
+WINDOW_NAME = "3D Cube Control"
+
 # --- Initialize the MediaPipe Hands module ---
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(
@@ -179,6 +183,10 @@ def draw_cube(frame, position, rotation, scale, color):
 # MAIN LOOP: Capture from Webcam
 # ==============================
 cap = cv2.VideoCapture(0)  # Open the default webcam (0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+cv2.resizeWindow(WINDOW_NAME, CAMERA_WIDTH, CAMERA_HEIGHT)
 
 print("=== 3D Cube Control (Two-Handed) ===")
 print("Left Hand Controls:")
@@ -309,7 +317,7 @@ while cap.isOpened():
     draw_cube(frame, cube_position, cube_rotation, cube_scale, cube_color)
 
     # Show the webcam video with cube
-    cv2.imshow('3D Cube Control', frame)
+    cv2.imshow(WINDOW_NAME, frame)
 
     # Handle keyboard input
     key = cv2.waitKey(1) & 0xFF

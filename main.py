@@ -1,958 +1,739 @@
-# ==============================
-# 🖐️ INTEGRATED GESTURE MENU SYSTEM
-# ==============================
-# All modules run in the same window - no separate processes
-# Choose different modules by pointing and selecting
-# ==============================
+import math
+import time
+from pathlib import Path
 
 import cv2
+import mediapipe as mp
 import numpy as np
-import time
-import pyautogui
-from collections import deque
-import json
-import math
-import os
 
-# Configuration
-CONFIG = {
-    'smoothing_window': 3,
-    'gesture_hold_time': 0.5,
-    'mouse_sensitivity': 1.5,
-    'save_gestures': True,
-    'camera_index': 0
-}
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:
+    Image = None
+    ImageDraw = None
+    ImageFont = None
 
-class MenuModule:
-    def __init__(self, name, description, icon):
-        self.name = name
-        self.description = description
-        self.icon = icon
-        self.x = 0
-        self.y = 0
-        self.width = 200
-        self.height = 150
-        self.selected = False
 
-class IntegratedGestureMenu:
-    def __init__(self):
-        # Initialize camera
-        self.cap = cv2.VideoCapture(CONFIG['camera_index'])
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        self.cap.set(cv2.CAP_PROP_FPS, 30)
-        
-        # Background subtractor for hand detection
-        self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(detectShadows=True)
-        
-        # Tracking variables
-        self.gesture_history = deque(maxlen=CONFIG['smoothing_window'])
-        self.last_gesture_time = time.time()
-        self.current_gesture = "No Hand Detected"
-        self.mouse_position = (0, 0)
-        self.prev_mouse_pos = (0, 0)
-        
-        # Menu variables
-        self.current_module_index = 0
-        self.hovered_module = None
-        self.menu_active = True
-        self.current_mode = "menu"  # "menu", "text_writing", "mouse_control", etc.
-        
-        # Gesture counters
-        self.gesture_stats = {}
-        self.session_start = time.time()
-        
-        # Hand detection parameters
-        self.hand_contour_min_area = 3000
-        self.hand_contour_max_area = 80000
-        
-        # Text writing variables
-        self.keyboard = [
-            ['Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P'],
-            ['A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L'],
-            ['Z', 'X', 'C', 'V', 'B', 'N', 'M'],
-            ['SPACE', 'BACKSPACE', 'ENTER']
-        ]
-        self.current_key_pos = [0, 0]
-        self.current_key = self.keyboard[0][0]
-        self.last_text_time = time.time()
-        
-        # Mouse control variables
-        self.mouse_sensitivity = 2.0
-        
-        # Create menu modules
-        self.create_menu_modules()
-        
-    def create_menu_modules(self):
-        """Create available menu modules"""
-        self.modules = [
-            MenuModule("Gesture Detection", "Basic hand gesture recognition", "👋"),
-            MenuModule("Text Writing", "Type text with hand gestures", "⌨️"),
-            MenuModule("Mouse Control", "Control cursor with gestures", "🖱️"),
-            MenuModule("Presentation", "Control slides hands-free", "📊"),
-            MenuModule("Volume Control", "Adjust system volume", "🔊"),
-            MenuModule("Sign Language", "Learn sign language basics", "🤟"),
-            MenuModule("Games", "Play gesture-based games", "🎮"),
-            MenuModule("Settings", "Configure the system", "⚙️"),
-            MenuModule("Back to Menu", "Return to main menu", "🔙")
-        ]
-        
-        # Arrange modules in a grid
-        self.arrange_modules_grid()
-    
-    def arrange_modules_grid(self):
-        """Arrange modules in a 3x3 grid"""
-        cols = 3
-        rows = 3
-        start_x = 50
-        start_y = 100
-        spacing_x = 250
-        spacing_y = 200
-        
-        for i, module in enumerate(self.modules):
-            row = i // cols
-            col = i % cols
-            module.x = start_x + col * spacing_x
-            module.y = start_y + row * spacing_y
-    
-    def detect_hand(self, frame):
-        """Detect hand using background subtraction and contour detection"""
-        # Apply background subtraction
-        fg_mask = self.bg_subtractor.apply(frame)
-        
-        # Apply morphological operations to clean up the mask
-        kernel = np.ones((5,5), np.uint8)
-        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
-        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
-        
-        # Find contours
-        contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        # Filter contours by area
-        hand_contours = []
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if self.hand_contour_min_area < area < self.hand_contour_max_area:
-                hand_contours.append(contour)
-        
-        return hand_contours, fg_mask
-    
-    def count_fingers_from_contour(self, contour, frame):
-        """Count fingers from hand contour using convexity defects"""
-        if len(contour) < 5:
-            return 0, contour
-        
-        # Find convex hull
-        hull = cv2.convexHull(contour, returnPoints=False)
-        
-        # Find convexity defects
-        defects = cv2.convexityDefects(contour, hull)
-        
-        if defects is None:
-            return 0, contour
-        
-        # Count fingers based on defects
-        finger_count = 0
-        
-        for i in range(defects.shape[0]):
-            s, e, f, d = defects[i, 0]
-            start = tuple(contour[s][0])
-            end = tuple(contour[e][0])
-            far = tuple(contour[f][0])
-            
-            # Calculate angle
-            angle = self.calculate_angle(start, far, end)
-            
-            # Count as finger if angle is less than 90 degrees and depth is significant
-            if angle < 90 and d > 8000:
-                finger_count += 1
-        
-        # Special case for pointing gesture (index finger extended)
-        if finger_count == 1:
-            # Get contour center and topmost point
-            M = cv2.moments(contour)
-            if M["m00"] != 0:
-                cx = int(M["m10"] / M["m00"])
-                cy = int(M["m01"] / M["m00"])
-                
-                # Find the topmost point of the contour
-                contour_points = contour.reshape(-1, 2)
-                topmost_idx = np.argmin(contour_points[:, 1])
-                topmost_point = tuple(contour_points[topmost_idx])
-                
-                # Check if topmost point is significantly above center
-                if topmost_point[1] < cy - 30:
-                    return 1, contour
-        
-        # Adjust finger count
-        if finger_count > 0:
-            finger_count = min(finger_count + 1, 5)
-        
-        return finger_count, contour
-    
-    def calculate_angle(self, a, b, c):
-        """Calculate angle between three points"""
-        a = np.array(a)
-        b = np.array(b)
-        c = np.array(c)
-        
-        ba = a - b
-        bc = c - b
-        
-        cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
-        angle = np.arccos(cosine_angle)
-        
-        return np.degrees(angle)
-    
-    def detect_gesture_from_fingers(self, finger_count, contour_center):
-        """Detect gesture based on finger count and position"""
-        if finger_count == 0:
-            return "Fist"
-        elif finger_count == 5:
-            return "Palm"
-        elif finger_count == 1:
-            return "Point"
-        elif finger_count == 2:
-            return "Peace"
-        elif finger_count == 3:
-            return "Three_Fingers"
-        else:
-            return f"{finger_count}_Fingers"
-    
-    def get_hovered_module(self, hand_center):
-        """Get which module is being hovered over"""
-        if not hand_center:
-            return None
-        
-        x, y = hand_center
-        for module in self.modules:
-            if (module.x <= x <= module.x + module.width and
-                module.y <= y <= module.y + module.height):
-                return module
+WINDOW_NAME = "MediaPipe Drag and Drop Demo"
+SLIDES_DIR = Path("slides")
+FRAME_WIDTH = 1280
+FRAME_HEIGHT = 720
+CAMERA_WIDTH = 1280
+CAMERA_HEIGHT = 720
+SMOOTHING = 0.18
+SNAP_SPEED = 0.22
+CARD_WIDTH = 92
+CARD_HEIGHT = 56
+CARD_GAP_X = 12
+CARD_GAP_Y = 12
+CARD_START_X = 20
+CARD_START_Y = 198
+CARD_COLUMNS = 2
+CARD_ROWS = 3
+PAGE_SIZE = CARD_COLUMNS * CARD_ROWS
+GRAB_RADIUS = 65
+HAND_LOST_GRACE_SECONDS = 0.35
+HOVER_PICKUP_SECONDS = 0.35
+HOVER_DROP_SECONDS = 0.12
+DROP_FLASH_SECONDS = 0.55
+SHOW_START_SCREEN = True
+PREVIEW_X = 700
+PREVIEW_Y = 95
+PREVIEW_WIDTH = 500
+PREVIEW_HEIGHT = 530
+PREVIEW_SCALE = 0.72
+ACCENT = (255, 168, 87)
+PANEL_BG = (22, 26, 35)
+PANEL_BG_ALT = (30, 36, 48)
+PANEL_STROKE = (55, 64, 82)
+TEXT_PRIMARY = (245, 247, 250)
+TEXT_MUTED = (180, 188, 200)
+SUCCESS = (129, 230, 160)
+FONT_REGULAR = Path(r"C:\Windows\Fonts\segoeui.ttf")
+FONT_BOLD = Path(r"C:\Windows\Fonts\seguisb.ttf")
+TEXT_CACHE = {}
+
+
+class DraggableCard:
+    def __init__(self, label, x, y, w, h, color, image=None):
+        self.label = label
+        self.x = x
+        self.y = y
+        self.w = w
+        self.h = h
+        self.color = color
+        self.image = image
+        self.placed_in = None
+        self.target_position = None
+        self.home_position = (x, y)
+
+    def contains(self, px, py):
+        return self.x <= px <= self.x + self.w and self.y <= py <= self.y + self.h
+
+    def center(self):
+        return self.x + self.w // 2, self.y + self.h // 2
+
+    def set_target(self, x, y):
+        self.target_position = (x, y)
+
+    def clear_target(self):
+        self.target_position = None
+
+    def reset_to_home(self):
+        self.x, self.y = self.home_position
+        self.clear_target()
+
+
+class DropZone:
+    def __init__(self, label, x, y, w, h, color):
+        self.label = label
+        self.x = x
+        self.y = y
+        self.w = w
+        self.h = h
+        self.color = color
+
+    def contains(self, px, py):
+        return self.x <= px <= self.x + self.w and self.y <= py <= self.y + self.h
+
+
+def clamp(value, minimum, maximum):
+    return max(minimum, min(value, maximum))
+
+
+def distance(point_a, point_b):
+    return math.hypot(point_a[0] - point_b[0], point_a[1] - point_b[1])
+
+
+def smooth_point(previous_point, target_point, alpha):
+    if previous_point is None:
+        return target_point
+
+    x = int(previous_point[0] + (target_point[0] - previous_point[0]) * alpha)
+    y = int(previous_point[1] + (target_point[1] - previous_point[1]) * alpha)
+    return x, y
+
+
+def load_font(size, bold=False):
+    if ImageFont is None:
         return None
-    
-    def switch_mode(self, mode):
-        """Switch between different modes"""
-        self.current_mode = mode
-        self.menu_active = (mode == "menu")
-        print(f"🔄 Switched to {mode} mode")
-    
-    def execute_gesture_action(self, gesture, contour_center=None):
-        """Execute actions based on detected gestures"""
-        if self.current_mode == "menu":
-            self.execute_menu_action(gesture, contour_center)
-        elif self.current_mode == "text_writing":
-            self.execute_text_writing_action(gesture, contour_center)
-        elif self.current_mode == "mouse_control":
-            self.execute_mouse_control_action(gesture, contour_center)
-        elif self.current_mode == "presentation":
-            self.execute_presentation_action(gesture, contour_center)
-        elif self.current_mode == "volume_control":
-            self.execute_volume_control_action(gesture, contour_center)
-    
-    def execute_menu_action(self, gesture, contour_center=None):
-        """Execute menu actions"""
-        if gesture == "Point" and contour_center:
-            # Check which module is being hovered
-            hovered = self.get_hovered_module(contour_center)
-            if hovered:
-                # Unselect all
-                for module in self.modules:
-                    module.selected = False
-                # Select hovered
-                hovered.selected = True
-                self.current_module_index = self.modules.index(hovered)
-                self.hovered_module = hovered
-                
-        elif gesture == "Fist":
-            # Launch selected module
-            if self.hovered_module:
-                module_name = self.hovered_module.name
-                print(f"🚀 Launching: {module_name}")
-                
-                if module_name == "Text Writing":
-                    self.switch_mode("text_writing")
-                elif module_name == "Mouse Control":
-                    self.switch_mode("mouse_control")
-                elif module_name == "Presentation":
-                    self.switch_mode("presentation")
-                elif module_name == "Volume Control":
-                    self.switch_mode("volume_control")
-                elif module_name == "Gesture Detection":
-                    self.switch_mode("gesture_detection")
-                elif module_name == "Sign Language":
-                    self.switch_mode("sign_language")
-                elif module_name == "Games":
-                    self.switch_mode("games")
-                elif module_name == "Settings":
-                    self.switch_mode("settings")
-                elif module_name == "Back to Menu":
-                    self.switch_mode("menu")
-    
-    def execute_text_writing_action(self, gesture, contour_center=None):
-        """Execute text writing actions"""
-        if gesture == "Point" and contour_center:
-            # Navigate keyboard based on hand position
-            frame_center_x, frame_center_y = 320, 240
-            cx, cy = contour_center
-            
-            if cx > frame_center_x + 50:
-                self.navigate_keyboard("right")
-            elif cx < frame_center_x - 50:
-                self.navigate_keyboard("left")
-            elif cy > frame_center_y + 50:
-                self.navigate_keyboard("down")
-            elif cy < frame_center_y - 50:
-                self.navigate_keyboard("up")
-        
-        elif gesture == "Fist":
-            # Type selected key
-            if time.time() - self.last_text_time > 0.5:
-                self.type_key(self.current_key)
-                self.last_text_time = time.time()
-        
-        elif gesture == "Palm":
-            # Go back to menu
-            self.switch_mode("menu")
-    
-    def execute_mouse_control_action(self, gesture, contour_center=None):
-        """Execute mouse control actions"""
-        if gesture == "Point" and contour_center:
-            # Move mouse based on hand position
-            screen_width, screen_height = pyautogui.size()
-            mouse_x = int((1 - contour_center[0] / 640) * screen_width)
-            mouse_y = int((contour_center[1] / 480) * screen_height)
-            pyautogui.moveTo(mouse_x, mouse_y)
-        
-        elif gesture == "Fist":
-            # Click
-            pyautogui.click()
-        
-        elif gesture == "Palm":
-            # Go back to menu
-            self.switch_mode("menu")
-    
-    def execute_presentation_action(self, gesture, contour_center=None):
-        """Execute presentation control actions"""
-        if gesture == "Peace":
-            # Next slide
-            pyautogui.press('right')
-            print("➡️ Next slide")
-        elif gesture == "Call_Me":
-            # Previous slide
-            pyautogui.press('left')
-            print("⬅️ Previous slide")
-        elif gesture == "Palm":
-            # Go back to menu
-            self.switch_mode("menu")
-    
-    def execute_volume_control_action(self, gesture, contour_center=None):
-        """Execute volume control actions"""
-        if gesture == "Three_Fingers":
-            # Volume up
-            pyautogui.press('volumeup')
-            print("🔊 Volume up")
-        elif gesture == "Two_Fingers":
-            # Volume down
-            pyautogui.press('volumedown')
-            print("🔉 Volume down")
-        elif gesture == "Palm":
-            # Go back to menu
-            self.switch_mode("menu")
-    
-    def navigate_keyboard(self, direction):
-        """Navigate virtual keyboard"""
-        rows = len(self.keyboard)
-        cols = len(self.keyboard[0])
-        
-        if direction == "right":
-            self.current_key_pos[1] = (self.current_key_pos[1] + 1) % cols
-            if self.current_key_pos[1] >= len(self.keyboard[self.current_key_pos[0]]):
-                self.current_key_pos[1] = 0
-        elif direction == "left":
-            self.current_key_pos[1] = (self.current_key_pos[1] - 1) % cols
-            if self.current_key_pos[1] < 0:
-                self.current_key_pos[1] = len(self.keyboard[self.current_key_pos[0]]) - 1
-        elif direction == "down":
-            self.current_key_pos[0] = (self.current_key_pos[0] + 1) % rows
-            if self.current_key_pos[1] >= len(self.keyboard[self.current_key_pos[0]]):
-                self.current_key_pos[1] = len(self.keyboard[self.current_key_pos[0]]) - 1
-        elif direction == "up":
-            self.current_key_pos[0] = (self.current_key_pos[0] - 1) % rows
-            if self.current_key_pos[1] >= len(self.keyboard[self.current_key_pos[0]]):
-                self.current_key_pos[1] = len(self.keyboard[self.current_key_pos[0]]) - 1
-        
-        self.current_key = self.keyboard[self.current_key_pos[0]][self.current_key_pos[1]]
-    
-    def type_key(self, key):
-        """Type the selected key"""
-        if key == 'SPACE':
-            pyautogui.press('space')
-            print("📝 Typed: SPACE")
-        elif key == 'BACKSPACE':
-            pyautogui.press('backspace')
-            print("📝 Typed: BACKSPACE")
-        elif key == 'ENTER':
-            pyautogui.press('enter')
-            print("📝 Typed: ENTER")
-        else:
-            pyautogui.typewrite(key)
-            print(f"📝 Typed: {key}")
-    
-    def draw_ui(self, frame, gesture, contours=None):
-        """Draw UI based on current mode"""
-        if self.current_mode == "menu":
-            return self.draw_menu_ui(frame, gesture, contours)
-        elif self.current_mode == "text_writing":
-            return self.draw_text_writing_ui(frame, gesture, contours)
-        elif self.current_mode == "mouse_control":
-            return self.draw_mouse_control_ui(frame, gesture, contours)
-        elif self.current_mode == "presentation":
-            return self.draw_presentation_ui(frame, gesture, contours)
-        else:
-            return self.draw_generic_ui(frame, gesture, contours)
-    
-    def draw_menu_ui(self, frame, gesture, contours=None):
-        """Draw menu UI"""
+    font_path = FONT_BOLD if bold and FONT_BOLD.exists() else FONT_REGULAR
+    if not font_path.exists():
+        return None
+    return ImageFont.truetype(str(font_path), size)
+
+
+def get_cached_text_image(text, size, color, bold):
+    cache_key = (text, size, color, bold)
+    if cache_key in TEXT_CACHE:
+        return TEXT_CACHE[cache_key]
+
+    font = load_font(size, bold=bold)
+    if font is None or Image is None or ImageDraw is None:
+        return None
+
+    dummy = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(dummy)
+    bbox = draw.textbbox((0, 0), text, font=font)
+    width = max(1, bbox[2] - bbox[0])
+    height = max(1, bbox[3] - bbox[1])
+
+    image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    draw.text((-bbox[0], -bbox[1]), text, font=font, fill=(color[2], color[1], color[0], 255))
+    text_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGBA2BGRA)
+    TEXT_CACHE[cache_key] = text_image
+    return text_image
+
+
+def draw_text(frame, text, origin, size, color, *, bold=False):
+    text_image = get_cached_text_image(text, size, color, bold)
+    if text_image is None:
+        scale = max(0.5, size / 32.0)
+        thickness = 2 if bold else 1
+        font_face = cv2.FONT_HERSHEY_DUPLEX if bold else cv2.FONT_HERSHEY_SIMPLEX
+        baseline_y = origin[1] + size
+        cv2.putText(frame, text, (origin[0], baseline_y), font_face, scale, color, thickness, cv2.LINE_AA)
+        return
+
+    x, y = origin
+    h, w = text_image.shape[:2]
+    if x >= frame.shape[1] or y >= frame.shape[0]:
+        return
+
+    x0 = max(0, x)
+    y0 = max(0, y)
+    x1 = min(frame.shape[1], x + w)
+    y1 = min(frame.shape[0], y + h)
+    if x0 >= x1 or y0 >= y1:
+        return
+
+    text_crop = text_image[y0 - y:y1 - y, x0 - x:x1 - x]
+    alpha = text_crop[:, :, 3:4] / 255.0
+    frame_region = frame[y0:y1, x0:x1].astype(np.float32)
+    text_rgb = text_crop[:, :, :3].astype(np.float32)
+    blended = text_rgb * alpha + frame_region * (1.0 - alpha)
+    frame[y0:y1, x0:x1] = blended.astype(np.uint8)
+
+
+def draw_panel(frame, x, y, w, h, fill_color, border_color=None, alpha=0.88, border_thickness=2):
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x, y), (x + w, y + h), fill_color, -1)
+    frame[:] = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
+    if border_color is not None:
+        cv2.rectangle(frame, (x, y), (x + w, y + h), border_color, border_thickness)
+
+
+def draw_metric(frame, label, value, x, y):
+    draw_text(frame, label, (x, y), 11, TEXT_MUTED, bold=False)
+    draw_text(frame, value, (x, y + 14), 16, TEXT_PRIMARY, bold=True)
+
+
+def resize_image_to_fit(image, max_width, max_height):
+    if image is None or max_width <= 0 or max_height <= 0:
+        return None
+
+    src_h, src_w = image.shape[:2]
+    if src_h == 0 or src_w == 0:
+        return None
+
+    scale = min(max_width / src_w, max_height / src_h)
+    new_width = max(1, int(src_w * scale))
+    new_height = max(1, int(src_h * scale))
+    interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+    return cv2.resize(image, (new_width, new_height), interpolation=interpolation)
+
+
+def paste_centered_image(frame, image, x, y, w, h, background_color):
+    cv2.rectangle(frame, (x, y), (x + w, y + h), background_color, -1)
+    resized = resize_image_to_fit(image, w, h)
+    if resized is None:
+        return
+
+    image_h, image_w = resized.shape[:2]
+    offset_x = x + (w - image_w) // 2
+    offset_y = y + (h - image_h) // 2
+    frame[offset_y:offset_y + image_h, offset_x:offset_x + image_w] = resized
+
+
+def draw_card(frame, card, active=False):
+    fill_color = PANEL_BG_ALT if not active else (246, 247, 249)
+    border_color = PANEL_STROKE if not active else ACCENT
+    draw_panel(frame, card.x, card.y, card.w, card.h, fill_color, border_color, alpha=0.95, border_thickness=2)
+    if card.image is not None:
+        image_h = card.h - 34
+        image_w = card.w - 20
+        paste_centered_image(frame, card.image, card.x + 10, card.y + 10, image_w, image_h, fill_color)
+    draw_text(frame, card.label, (card.x + 14, card.y + card.h - 28), 15, TEXT_PRIMARY if not active else (35, 35, 35), bold=True)
+
+
+def draw_presenting_outline(frame, card):
+    cv2.rectangle(frame, (card.x - 4, card.y - 4), (card.x + card.w + 4, card.y + card.h + 4), SUCCESS, 2)
+    draw_text(frame, "LIVE", (card.x + 6, card.y + 2), 7, SUCCESS, bold=True)
+
+
+def draw_hover_outline(frame, card):
+    cv2.rectangle(frame, (card.x - 4, card.y - 4), (card.x + card.w + 4, card.y + card.h + 4), ACCENT, 2)
+
+
+def draw_hover_progress(frame, center, radius, progress, color):
+    progress = clamp(progress, 0.0, 1.0)
+    cv2.circle(frame, center, radius, (55, 55, 55), 2)
+    if progress <= 0:
+        return
+    start_angle = -90
+    end_angle = int(start_angle + 360 * progress)
+    cv2.ellipse(frame, center, (radius, radius), 0, start_angle, end_angle, color, 4)
+
+
+def draw_zone(frame, zone, cards, hovered=False, filled=False):
+    fill_color = (35, 44, 58) if filled else PANEL_BG
+    if hovered:
+        fill_color = (42, 52, 68)
+    border_color = ACCENT if hovered else PANEL_STROKE
+    draw_panel(frame, zone.x, zone.y, zone.w, zone.h, fill_color, border_color, alpha=0.96, border_thickness=3 if hovered else 2)
+    draw_text(frame, zone.label, (zone.x + 18, zone.y + 12), 14, TEXT_MUTED, bold=True)
+
+
+def draw_slide_preview(frame, card, zoom_scale, zone):
+    panel_x = zone.x
+    panel_y = zone.y
+    panel_w = min(int(zone.w * zoom_scale * 0.94), frame.shape[1] - panel_x - 12)
+    panel_h = min(int(zone.h * zoom_scale * 0.94), frame.shape[0] - panel_y - 18)
+    panel_w = max(panel_w, 260)
+    panel_h = max(panel_h, 240)
+
+    draw_panel(frame, panel_x, panel_y, panel_w, panel_h, PANEL_BG_ALT, ACCENT, alpha=0.97, border_thickness=2)
+
+    title = card.label[:40]
+    draw_text(frame, "Presentation View", (panel_x + 18, panel_y + 10), 14, TEXT_MUTED, bold=True)
+    draw_text(frame, title, (panel_x + 18, panel_y + panel_h - 32), 18, TEXT_PRIMARY, bold=True)
+
+    image_x = panel_x + 18
+    image_y = panel_y + 48
+    image_w = max(panel_w - 36, 120)
+    image_h = max(panel_h - 82, 120)
+
+    if card.image is not None:
+        paste_centered_image(frame, card.image, image_x, image_y, image_w, image_h, (18, 22, 30))
+    else:
+        cv2.rectangle(frame, (image_x, image_y), (image_x + image_w, image_y + image_h), card.color, -1)
+        draw_text(frame, title, (image_x + 24, image_y + image_h // 2 - 18), 24, (30, 30, 30), bold=True)
+
+
+def draw_start_screen(frame, hand_ready):
+    h, w = frame.shape[:2]
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (w, h), (10, 14, 26), -1)
+    frame[:] = cv2.addWeighted(overlay, 0.82, frame, 0.18, 0)
+
+    draw_text(frame, "Handsome Presentation Demo", (30, 28), 28, (255, 255, 255), bold=True)
+    draw_text(frame, "Raise one hand and keep it visible to begin", (30, 88), 18, (220, 220, 220), bold=False)
+    draw_text(frame, "Hover on a slide to pick it up", (30, 150), 18, (160, 240, 255), bold=True)
+    draw_text(frame, "Hover on the right box to drop it", (30, 184), 18, (160, 240, 255), bold=True)
+    draw_text(frame, "SPACE: start   F: fullscreen   Q: quit", (30, h - 110), 18, (255, 255, 255), bold=False)
+
+    status_color = (120, 255, 180) if hand_ready else (255, 210, 120)
+    status_text = "Hand detected - ready to start" if hand_ready else "Waiting for hand"
+    box_x = 30
+    box_y = h - 70
+    box_w = min(w - 60, 320)
+    cv2.rectangle(frame, (box_x, box_y), (box_x + box_w, box_y + 40), (24, 30, 46), -1)
+    cv2.rectangle(frame, (box_x, box_y), (box_x + box_w, box_y + 40), status_color, 3)
+    draw_text(frame, status_text, (box_x + 14, box_y + 4), 18, (255, 255, 255), bold=True)
+
+
+def animate_card(card):
+    if card.target_position is None:
+        return
+
+    target_x, target_y = card.target_position
+    next_x = int(card.x + (target_x - card.x) * SNAP_SPEED)
+    next_y = int(card.y + (target_y - card.y) * SNAP_SPEED)
+    card.x = next_x
+    card.y = next_y
+
+    if abs(card.x - target_x) <= 2 and abs(card.y - target_y) <= 2:
+        card.x = target_x
+        card.y = target_y
+        card.clear_target()
+
+
+def load_slide_image(image_path):
+    image = cv2.imread(str(image_path))
+    if image is None:
+        return None
+    return image
+
+
+def nearest_card(cards, point, max_distance):
+    best_card = None
+    best_distance = max_distance
+    for card in cards:
+        center = card.center()
+        current_distance = distance(center, point)
+        if current_distance <= best_distance:
+            best_distance = current_distance
+            best_card = card
+    return best_card
+
+
+def overlap_area(card, zone):
+    left = max(card.x, zone.x)
+    top = max(card.y, zone.y)
+    right = min(card.x + card.w, zone.x + zone.w)
+    bottom = min(card.y + card.h, zone.y + zone.h)
+    if right <= left or bottom <= top:
+        return 0
+    return (right - left) * (bottom - top)
+
+
+def best_drop_zone(card, zones):
+    best_zone = None
+    best_overlap = 0
+    for zone in zones:
+        current_overlap = overlap_area(card, zone)
+        if current_overlap > best_overlap:
+            best_overlap = current_overlap
+            best_zone = zone
+    return best_zone
+
+
+def zone_under_cursor(point, zones):
+    for zone in zones:
+        if zone.contains(*point):
+            return zone
+    return None
+
+
+def build_card_positions(count):
+    positions = []
+    for index in range(count):
+        row = index // CARD_COLUMNS
+        col = index % CARD_COLUMNS
+        x = CARD_START_X + col * (CARD_WIDTH + CARD_GAP_X)
+        y = CARD_START_Y + row * (CARD_HEIGHT + CARD_GAP_Y)
+        positions.append((x, y))
+    return positions
+
+
+def update_card_layout(cards, positions):
+    for card, (x, y) in zip(cards, positions):
+        card.x = x
+        card.y = y
+        card.home_position = (x, y)
+        card.clear_target()
+
+
+def create_cards_from_folder():
+    supported_extensions = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+    slide_paths = sorted(
+        path for path in SLIDES_DIR.iterdir()
+        if path.is_file() and path.suffix.lower() in supported_extensions
+    ) if SLIDES_DIR.exists() else []
+    fallback_colors = [
+        (77, 177, 255),
+        (115, 232, 180),
+        (255, 204, 102),
+        (255, 140, 140),
+        (180, 150, 255),
+        (130, 220, 220),
+    ]
+
+    visible_count = max(3, len(slide_paths))
+    positions = build_card_positions(visible_count)
+
+    cards = []
+    for index, (x, y) in enumerate(positions):
+        image = None
+        label = f"Slide {index + 1}"
+        if index < len(slide_paths):
+            image = load_slide_image(slide_paths[index])
+            label = slide_paths[index].stem.replace("_", " ").replace("-", " ")
+
+        cards.append(
+            DraggableCard(
+                label,
+                x,
+                y,
+                CARD_WIDTH,
+                CARD_HEIGHT,
+                fallback_colors[index % len(fallback_colors)],
+                image=image,
+            )
+        )
+
+    return cards, len(slide_paths)
+
+
+def reset_cards(cards):
+    for card in cards:
+        card.reset_to_home()
+        card.placed_in = None
+
+
+def get_visible_cards(cards, page_index):
+    start = page_index * PAGE_SIZE
+    end = start + PAGE_SIZE
+    return cards[start:end]
+
+
+def main():
+    mp_hands = mp.solutions.hands
+    mp_draw = mp.solutions.drawing_utils
+    hands = mp_hands.Hands(
+        static_image_mode=False,
+        max_num_hands=1,
+        min_detection_confidence=0.7,
+        min_tracking_confidence=0.7,
+    )
+
+    cards, loaded_slide_count = create_cards_from_folder()
+    total_pages = 1
+    page_index = 0
+    visible_cards = cards
+    update_card_layout(visible_cards, build_card_positions(len(visible_cards)))
+
+    presentation_zone = DropZone("Presentation", 250, 95, 360, 300, (61, 111, 255))
+
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW_NAME, CAMERA_WIDTH, CAMERA_HEIGHT)
+
+    cursor_point = None
+    dragged_card = None
+    drag_offset = (0, 0)
+    status_text = "Show one hand to begin"
+    action_text = "Waiting"
+    target_text = "-"
+    active_zone_label = None
+    hovered_card = None
+    hovered_zone = None
+    hover_pickup_since = None
+    hover_drop_since = None
+    drop_flash_until = 0.0
+    last_drop_zone_label = None
+    presented_card = None
+    preview_zoom = 1.0
+    previous_frame_time = time.time()
+    last_hand_seen_time = previous_frame_time
+    fps = 0.0
+    show_start_screen = SHOW_START_SCREEN
+    fullscreen_enabled = False
+
+    print("MediaPipe Drag and Drop Demo")
+    print("Move: point with your index finger")
+    print("Pick up: hover over a slide")
+    print("Drop: hover over the presentation box on the right")
+    print(f"Slides folder: {SLIDES_DIR.resolve()}")
+    print(f"Loaded slide images: {loaded_slide_count}")
+    print("Press ENTER to present the hovered slide")
+    print("Press 'r' to reset cards")
+    print("Press 'q' to quit")
+
+    while cap.isOpened():
+        success, frame = cap.read()
+        if not success:
+            continue
+
+        frame = cv2.flip(frame, 1)
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = hands.process(rgb_frame)
+        hand_landmarks_to_draw = None
+
         h, w, _ = frame.shape
-        
-        # Draw title
-        cv2.putText(frame, "GESTURE MENU SYSTEM", (10, 40),
-                   cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3)
-        
-        # Dynamic instruction
-        if gesture == "Point":
-            instruction = "✋ POINTING - Move hand to select module"
-            instruction_color = (0, 255, 0)
-        elif gesture == "Fist" and self.hovered_module:
-            instruction = "✊ FIST - Launch selected module!"
-            instruction_color = (0, 255, 255)
-        else:
-            instruction = "Point to select, Fist to launch"
-            instruction_color = (200, 200, 200)
-        
-        cv2.putText(frame, instruction, (10, 70),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, instruction_color, 2)
-        
-        # Draw modules
-        for module in self.modules:
-            # Module background
-            if module.selected:
-                color = (0, 255, 0)
-                thickness = 3
-                bg_color = (0, 50, 0)
-            elif module == self.hovered_module:
-                color = (255, 255, 0)
-                thickness = 3
-                bg_color = (50, 50, 0)
+        hand_found = False
+        active_zone_label = None
+        hovered_card = None
+        hovered_zone = None
+        sidebar_x = 16
+        sidebar_y = 16
+        sidebar_w = min(220, max(180, w // 3))
+        sidebar_h = h - 32
+        stage_x = sidebar_x + sidebar_w + 16
+        stage_y = 72
+        stage_w = w - stage_x - 16
+        stage_h = h - stage_y - 16
+        presentation_zone.x = stage_x
+        presentation_zone.y = stage_y
+        presentation_zone.w = max(220, stage_w)
+        presentation_zone.h = max(180, stage_h)
+        footer_y_1 = h - 74
+        footer_y_2 = h - 46
+        footer_y_3 = h - 18
+
+        current_time = time.time()
+        frame_delta = max(current_time - previous_frame_time, 1e-6)
+        fps = 1.0 / frame_delta
+        previous_frame_time = current_time
+
+        if results.multi_hand_landmarks:
+            hand_found = True
+            last_hand_seen_time = current_time
+            hand_landmarks = results.multi_hand_landmarks[0]
+            hand_landmarks_to_draw = hand_landmarks
+
+            index_tip = hand_landmarks.landmark[8]
+
+            target_cursor = (int(index_tip.x * w), int(index_tip.y * h))
+            cursor_point = smooth_point(cursor_point, target_cursor, SMOOTHING)
+
+            for card in reversed(visible_cards):
+                if card.contains(*cursor_point):
+                    hovered_card = card
+                    break
+            if hovered_card is None:
+                hovered_card = nearest_card(visible_cards, cursor_point, GRAB_RADIUS)
+
+            if dragged_card is None:
+                if hovered_card is not None:
+                    if hover_pickup_since is None or target_text != hovered_card.label:
+                        hover_pickup_since = current_time
+                    target_text = hovered_card.label
+                    action_text = "Hover to pick"
+                    status_text = f"Hover on {hovered_card.label} to pick it up"
+                    if current_time - hover_pickup_since >= HOVER_PICKUP_SECONDS:
+                        dragged_card = hovered_card
+                        drag_offset = (cursor_point[0] - dragged_card.x, cursor_point[1] - dragged_card.y)
+                        dragged_card.clear_target()
+                        status_text = f"Holding {dragged_card.label}"
+                        action_text = "Grabbed"
+                        target_text = dragged_card.label
+                        hover_pickup_since = None
+                else:
+                    hover_pickup_since = None
+                    action_text = "Tracking"
+                    status_text = "Hover over a slide to pick it up"
+                    target_text = "-"
             else:
-                color = (100, 100, 100)
-                thickness = 2
-                bg_color = (30, 30, 30)
-            
-            cv2.rectangle(frame, (module.x, module.y), 
-                        (module.x + module.width, module.y + module.height), 
-                        bg_color, -1)
-            cv2.rectangle(frame, (module.x, module.y), 
-                        (module.x + module.width, module.y + module.height), 
-                        color, thickness)
-            
-            # Module text
-            cv2.putText(frame, module.icon, (module.x + 10, module.y + 40),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
-            cv2.putText(frame, module.name, (module.x + 10, module.y + 70),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-            cv2.putText(frame, module.description[:20], (module.x + 10, module.y + 90),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
-        
-        # Draw hand contours
-        if contours:
-            for contour in contours:
-                cv2.drawContours(frame, [contour], -1, (0, 255, 255), 2)
-                M = cv2.moments(contour)
-                if M["m00"] != 0:
-                    cx = int(M["m10"] / M["m00"])
-                    cy = int(M["m01"] / M["m00"])
-                    
-                    if gesture == "Point":
-                        cv2.circle(frame, (cx, cy), 12, (0, 255, 0), -1)
-                        cv2.circle(frame, (cx, cy), 12, (255, 255, 255), 2)
-                        cv2.arrowedLine(frame, (cx, cy), (cx, cy - 30), (0, 255, 0), 3)
-                        cv2.putText(frame, "POINTING", (cx - 40, cy - 40),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                    else:
-                        cv2.circle(frame, (cx, cy), 8, (255, 0, 0), -1)
-        
-        # Draw info
-        cv2.putText(frame, f"Gesture: {gesture}", (10, h - 100),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-        
-        if self.hovered_module:
-            cv2.putText(frame, f"Selected: {self.hovered_module.name}", (10, h - 70),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
-            cv2.putText(frame, "Make FIST to launch!", (10, h - 45),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-        
-        # Instructions
-        cv2.putText(frame, "👆 Point: Navigate | ✊ Fist: Launch | ✋ Palm: Back", (10, h - 20),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        
-        return frame
-    
-    def draw_text_writing_ui(self, frame, gesture, contours=None):
-        """Draw text writing UI"""
-        h, w, _ = frame.shape
-        
-        # Draw title
-        cv2.putText(frame, "TEXT WRITING MODE", (10, 30),
-                   cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3)
-        
-        # Draw instructions
-        cv2.putText(frame, "Point: Navigate | Fist: Type | Palm: Back to Menu", (10, 60),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
-        
-        # Draw keyboard
-        key_size = 40
-        key_spacing = 45
-        start_x = 50
-        start_y = 100
-        
-        for row_idx, row in enumerate(self.keyboard):
-            for col_idx, key in enumerate(row):
-                x = start_x + col_idx * key_spacing
-                y = start_y + row_idx * key_spacing
-                
-                # Highlight current key
-                if row_idx == self.current_key_pos[0] and col_idx == self.current_key_pos[1]:
-                    color = (0, 255, 0)
-                    thickness = 3
+                hover_pickup_since = None
+
+            if dragged_card is not None:
+                dragged_card.x = clamp(cursor_point[0] - drag_offset[0], 0, w - dragged_card.w)
+                dragged_card.y = clamp(cursor_point[1] - drag_offset[1], 90, h - dragged_card.h)
+                dragged_card.placed_in = None
+                dragged_card.clear_target()
+                status_text = f"Dragging {dragged_card.label}"
+                action_text = "Dragging"
+                drop_candidate = zone_under_cursor(cursor_point, [presentation_zone])
+                if drop_candidate is not None:
+                    active_zone_label = drop_candidate.label
+                    target_text = drop_candidate.label
+                    hovered_zone = drop_candidate
+                    if hover_drop_since is None:
+                        hover_drop_since = current_time
+                    elif current_time - hover_drop_since >= HOVER_DROP_SECONDS:
+                        snap_x = drop_candidate.x + (drop_candidate.w - dragged_card.w) // 2
+                        snap_y = drop_candidate.y + drop_candidate.h - dragged_card.h - 18
+                        dragged_card.set_target(snap_x, snap_y)
+                        dragged_card.placed_in = drop_candidate.label
+                        presented_card = dragged_card
+                        status_text = f"{dragged_card.label} dropped in {drop_candidate.label}"
+                        action_text = "Dropped"
+                        target_text = drop_candidate.label
+                        drop_flash_until = current_time + DROP_FLASH_SECONDS
+                        last_drop_zone_label = drop_candidate.label
+                        dragged_card = None
+                        hover_drop_since = None
                 else:
-                    color = (100, 100, 100)
-                    thickness = 1
-                
-                cv2.rectangle(frame, (x, y), (x + key_size, y + key_size), color, thickness)
-                cv2.putText(frame, key[:3], (x + 5, y + 25),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        
-        # Draw current key
-        cv2.putText(frame, f"Current: {self.current_key}", (10, h - 80),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
-        
-        # Draw gesture info
-        cv2.putText(frame, f"Gesture: {gesture}", (10, h - 50),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-        
-        # Draw hand contours
-        if contours:
-            for contour in contours:
-                cv2.drawContours(frame, [contour], -1, (0, 255, 255), 2)
-                M = cv2.moments(contour)
-                if M["m00"] != 0:
-                    cx = int(M["m10"] / M["m00"])
-                    cy = int(M["m01"] / M["m00"])
-                    
-                    if gesture == "Point":
-                        cv2.circle(frame, (cx, cy), 10, (0, 255, 0), -1)
-                        cv2.putText(frame, "POINT", (cx - 25, cy - 15),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                    else:
-                        cv2.circle(frame, (cx, cy), 6, (255, 0, 0), -1)
-        
-        cv2.putText(frame, "Open any text editor to type!", (10, h - 20),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-        
-        return frame
-    
-    def draw_mouse_control_ui(self, frame, gesture, contours=None):
-        """Draw mouse control UI"""
-        h, w, _ = frame.shape
-        
-        # Draw title
-        cv2.putText(frame, "MOUSE CONTROL MODE", (10, 30),
-                   cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3)
-        
-        # Draw instructions
-        cv2.putText(frame, "Point: Move cursor | Fist: Click | Palm: Back to Menu", (10, 60),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
-        
-        # Draw hand contours
-        if contours:
-            for contour in contours:
-                cv2.drawContours(frame, [contour], -1, (0, 255, 0), 2)
-                M = cv2.moments(contour)
-                if M["m00"] != 0:
-                    cx = int(M["m10"] / M["m00"])
-                    cy = int(M["m01"] / M["m00"])
-                    
-                    if gesture == "Point":
-                        cv2.circle(frame, (cx, cy), 12, (0, 255, 0), -1)
-                        cv2.putText(frame, "MOVING CURSOR", (cx - 50, cy - 20),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                    elif gesture == "Fist":
-                        cv2.circle(frame, (cx, cy), 12, (255, 0, 0), -1)
-                        cv2.putText(frame, "CLICK!", (cx - 20, cy - 20),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
-        
-        cv2.putText(frame, f"Gesture: {gesture}", (10, h - 50),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-        
-        return frame
-    
-    def draw_presentation_ui(self, frame, gesture, contours=None):
-        """Draw presentation control UI"""
-        h, w, _ = frame.shape
-        
-        # Draw title
-        cv2.putText(frame, "PRESENTATION CONTROL", (10, 30),
-                   cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3)
-        
-        # Draw instructions
-        cv2.putText(frame, "Peace: Next slide | Call Me: Previous | Palm: Back to Menu", (10, 60),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
-        
-        # Draw large navigation buttons
-        button_width = 150
-        button_height = 100
-        button_y = 200
-        
-        # Previous button
-        prev_x = 100
-        cv2.rectangle(frame, (prev_x, button_y), (prev_x + button_width, button_y + button_height), (100, 100, 255), -1)
-        cv2.putText(frame, "PREVIOUS", (prev_x + 20, button_y + 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        
-        # Next button
-        next_x = 400
-        cv2.rectangle(frame, (next_x, button_y), (next_x + button_width, button_y + button_height), (100, 255, 100), -1)
-        cv2.putText(frame, "NEXT", (next_x + 40, button_y + 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        
-        # Draw gesture info
-        cv2.putText(frame, f"Gesture: {gesture}", (10, h - 50),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-        
-        return frame
-    
-    def draw_generic_ui(self, frame, gesture, contours=None):
-        """Draw generic UI for other modes"""
-        h, w, _ = frame.shape
-        
-        if self.current_mode == "volume_control":
-            return self.draw_volume_control_ui(frame, gesture, contours)
-        elif self.current_mode == "gesture_detection":
-            return self.draw_gesture_detection_ui(frame, gesture, contours)
-        elif self.current_mode == "sign_language":
-            return self.draw_sign_language_ui(frame, gesture, contours)
-        elif self.current_mode == "games":
-            return self.draw_games_ui(frame, gesture, contours)
-        elif self.current_mode == "settings":
-            return self.draw_settings_ui(frame, gesture, contours)
-        else:
-            return self.draw_default_ui(frame, gesture, contours)
-    
-    def draw_volume_control_ui(self, frame, gesture, contours=None):
-        """Draw volume control UI"""
-        h, w, _ = frame.shape
-        
-        # Draw title
-        cv2.putText(frame, "VOLUME CONTROL MODE", (10, 30),
-                   cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3)
-        
-        # Draw instructions
-        cv2.putText(frame, "Three Fingers: Volume Up | Two Fingers: Volume Down | Palm: Back to Menu", (10, 60),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
-        
-        # Draw volume bar
-        bar_width = 400
-        bar_height = 40
-        bar_x = (w - bar_width) // 2
-        bar_y = h // 2 - 50
-        
-        # Background
-        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (50, 50, 50), -1)
-        
-        # Volume level (simulate current volume)
-        volume_level = 70  # You can get real volume if needed
-        fill_width = int((volume_level / 100) * bar_width)
-        
-        # Color based on volume level
-        if volume_level < 30:
-            color = (0, 0, 255)  # Red for low
-        elif volume_level < 70:
-            color = (0, 255, 255)  # Yellow for medium
-        else:
-            color = (0, 255, 0)  # Green for high
-        
-        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_width, bar_y + bar_height), color, -1)
-        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (255, 255, 255), 2)
-        
-        # Volume percentage
-        cv2.putText(frame, f"Volume: {volume_level}%", (bar_x + bar_width//2 - 60, bar_y + bar_height//2 + 10),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        
-        # Draw speaker icon
-        speaker_x = bar_x - 80
-        speaker_y = bar_y + bar_height // 2
-        
-        # Speaker body
-        cv2.rectangle(frame, (speaker_x, speaker_y - 20), (speaker_x + 30, speaker_y + 20), (255, 255, 255), -1)
-        cv2.rectangle(frame, (speaker_x + 30, speaker_y - 30), (speaker_x + 40, speaker_y + 30), (255, 255, 255), -1)
-        
-        # Sound waves
-        cv2.circle(frame, (speaker_x + 60, speaker_y), 8, (255, 255, 255), 2)
-        cv2.circle(frame, (speaker_x + 80, speaker_y), 12, (255, 255, 255), 2)
-        cv2.circle(frame, (speaker_x + 100, speaker_y), 16, (255, 255, 255), 2)
-        
-        # Draw gesture info
-        cv2.putText(frame, f"Gesture: {gesture}", (10, h - 50),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-        
-        # Volume change indicator
-        if gesture == "Three_Fingers":
-            cv2.putText(frame, "🔊 VOLUME UP", (w//2 - 80, h//2 + 100),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3)
-        elif gesture == "Two_Fingers":
-            cv2.putText(frame, "🔉 VOLUME DOWN", (w//2 - 80, h//2 + 100),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 3)
-        
-        return frame
-    
-    def draw_gesture_detection_ui(self, frame, gesture, contours=None):
-        """Draw gesture detection UI"""
-        h, w, _ = frame.shape
-        
-        # Draw title
-        cv2.putText(frame, "GESTURE DETECTION MODE", (10, 30),
-                   cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3)
-        
-        # Draw instructions
-        cv2.putText(frame, "Practice your hand gestures | Palm: Back to Menu", (10, 60),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
-        
-        # Draw gesture guide
-        gestures = [
-            ("✊ Fist", 100, 120),
-            ("✋ Palm", 250, 120),
-            ("👆 Point", 400, 120),
-            ("✌️ Peace", 100, 180),
-            ("🤟 Three Fingers", 250, 180),
-            ("🤙 Two Fingers", 400, 180)
-        ]
-        
-        for gesture_name, x, y in gestures:
-            cv2.putText(frame, gesture_name, (x, y),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-        
-        # Draw current detected gesture
-        cv2.putText(frame, f"Detected: {gesture}", (10, h - 100),
-                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
-        
-        # Draw hand contours
-        if contours:
-            for contour in contours:
-                cv2.drawContours(frame, [contour], -1, (0, 255, 255), 2)
-                M = cv2.moments(contour)
-                if M["m00"] != 0:
-                    cx = int(M["m10"] / M["m00"])
-                    cy = int(M["m01"] / M["m00"])
-                    cv2.circle(frame, (cx, cy), 8, (255, 0, 0), -1)
-        
-        return frame
-    
-    def draw_sign_language_ui(self, frame, gesture, contours=None):
-        """Draw sign language UI"""
-        h, w, _ = frame.shape
-        
-        # Draw title
-        cv2.putText(frame, "SIGN LANGUAGE MODE", (10, 30),
-                   cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3)
-        
-        # Draw instructions
-        cv2.putText(frame, "Learn sign language basics | Palm: Back to Menu", (10, 60),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
-        
-        # Draw sign language examples
-        signs = [
-            ("✌️ Peace = V Sign", 100, 120),
-            ("👍 Thumbs Up = Good", 100, 160),
-            ("🤙 OK Sign = Perfect", 100, 200),
-            ("✋ Palm = Hello", 400, 120),
-            ("✊ Fist = Stop", 400, 160),
-            ("👆 Point = You", 400, 200)
-        ]
-        
-        for sign_text, x, y in signs:
-            cv2.putText(frame, sign_text, (x, y),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-        
-        # Draw current detected gesture
-        cv2.putText(frame, f"Your Gesture: {gesture}", (10, h - 100),
-                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
-        
-        return frame
-    
-    def draw_games_ui(self, frame, gesture, contours=None):
-        """Draw games UI"""
-        h, w, _ = frame.shape
-        
-        # Draw title
-        cv2.putText(frame, "GAMES MODE", (10, 30),
-                   cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3)
-        
-        # Draw instructions
-        cv2.putText(frame, "Gesture-based games coming soon | Palm: Back to Menu", (10, 60),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
-        
-        # Draw coming soon message
-        cv2.putText(frame, "🎮 COMING SOON", (w//2 - 120, h//2),
-                   cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 0), 3)
-        
-        # Draw game concepts
-        games = [
-            ("🎯 Target Practice", 100, 300),
-            ("🎪 Catch the Moving Target", 100, 340),
-            ("🏆 Gesture Challenge", 400, 300),
-            ("🎮 Hand-Controlled Games", 400, 340)
-        ]
-        
-        for game_text, x, y in games:
-            cv2.putText(frame, game_text, (x, y),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (150, 150, 150), 1)
-        
-        return frame
-    
-    def draw_settings_ui(self, frame, gesture, contours=None):
-        """Draw settings UI"""
-        h, w, _ = frame.shape
-        
-        # Draw title
-        cv2.putText(frame, "SETTINGS MODE", (10, 30),
-                   cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3)
-        
-        # Draw instructions
-        cv2.putText(frame, "Configure system settings | Palm: Back to Menu", (10, 60),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
-        
-        # Draw settings options
-        settings = [
-            ("📹 Camera Settings", 100, 120),
-            ("🎯 Sensitivity: Medium", 100, 160),
-            ("⚡ Response Time: Fast", 100, 200),
-            ("💾 Save Sessions: ON", 400, 120),
-            ("🎨 UI Theme: Default", 400, 160),
-            ("🔊 Sound Effects: ON", 400, 200)
-        ]
-        
-        for setting_text, x, y in settings:
-            cv2.putText(frame, setting_text, (x, y),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-        
-        return frame
-    
-    def draw_default_ui(self, frame, gesture, contours=None):
-        """Draw default UI for unknown modes"""
-        h, w, _ = frame.shape
-        
-        # Draw title
-        cv2.putText(frame, f"{self.current_mode.upper()} MODE", (10, 30),
-                   cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3)
-        
-        # Draw instructions
-        cv2.putText(frame, "Use gestures to control | Palm: Back to Menu", (10, 60),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
-        
-        # Draw gesture info
-        cv2.putText(frame, f"Gesture: {gesture}", (10, h - 50),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-        
-        return frame
-    
-    def save_session_data(self):
-        """Save session statistics to file"""
-        if CONFIG['save_gestures']:
-            session_data = {
-                'duration': time.time() - self.session_start,
-                'gesture_stats': self.gesture_stats,
-                'timestamp': time.time(),
-                'integrated_mode': True
-            }
-            
-            with open('integrated_session.json', 'w') as f:
-                json.dump(session_data, f, indent=2)
-    
-    def run(self):
-        """Main execution loop"""
-        print("🖐️ Integrated Gesture Menu System Started!")
-        print("=" * 60)
-        print("INSTRUCTIONS:")
-        print("• All modules run in the SAME WINDOW!")
-        print("• Point to select, Fist to launch")
-        print("• Palm gesture to return to menu")
-        print("• Press 'q' to quit")
-        print("=" * 60)
-        
-        try:
-            while True:
-                ret, frame = self.cap.read()
-                if not ret:
-                    break
-                
-                # Flip for mirror view
-                frame = cv2.flip(frame, 1)
-                
-                # Detect hand
-                hand_contours, fg_mask = self.detect_hand(frame)
-                
-                current_gesture = "No Hand Detected"
-                contour_center = None
-                
-                if hand_contours:
-                    # Process the largest contour
-                    largest_contour = max(hand_contours, key=cv2.contourArea)
-                    
-                    # Count fingers
-                    finger_count, _ = self.count_fingers_from_contour(largest_contour, frame)
-                    
-                    # Detect gesture
-                    current_gesture = self.detect_gesture_from_fingers(finger_count, None)
-                    
-                    # Get contour center
-                    M = cv2.moments(largest_contour)
-                    if M["m00"] != 0:
-                        contour_center = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
-                    
-                    # Smooth gesture detection
-                    self.gesture_history.append(current_gesture)
-                    if len(self.gesture_history) >= CONFIG['smoothing_window']:
-                        most_common = max(set(self.gesture_history), key=list(self.gesture_history).count)
-                        
-                        # Execute action if gesture is stable
-                        if most_common == current_gesture and time.time() - self.last_gesture_time > CONFIG['gesture_hold_time']:
-                            self.execute_gesture_action(current_gesture, contour_center)
-                            # Update gesture statistics
-                            if current_gesture not in self.gesture_stats:
-                                self.gesture_stats[current_gesture] = 0
-                            self.gesture_stats[current_gesture] += 1
-                            self.last_gesture_time = time.time()
-                            self.current_gesture = current_gesture
-                else:
-                    self.hovered_module = None
-                
-                # Draw UI
-                frame = self.draw_ui(frame, current_gesture, hand_contours)
-                
-                # Show frame
-                cv2.namedWindow('Integrated Gesture Menu', cv2.WINDOW_NORMAL)
-                cv2.setWindowProperty('Integrated Gesture Menu', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-                cv2.imshow('Integrated Gesture Menu', frame)
-                
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
-                    
-        finally:
-            self.cap.release()
-            cv2.destroyAllWindows()
-            self.save_session_data()
-            print(f"Session saved! Total gestures detected: {sum(self.gesture_stats.values())}")
+                    hover_drop_since = None
+                    hovered_zone = None
+                    target_text = "None"
+            else:
+                hover_drop_since = None
+                hovered_zone = None
+
+            cv2.circle(frame, cursor_point, 12, (0, 255, 255), -1)
+
+        if not hand_found and current_time - last_hand_seen_time > HAND_LOST_GRACE_SECONDS:
+            cursor_point = None
+            dragged_card = None
+            hover_pickup_since = None
+            hover_drop_since = None
+            status_text = "Show one hand to begin"
+            action_text = "Waiting"
+            target_text = "-"
+
+        for card in visible_cards:
+            if card is not dragged_card:
+                animate_card(card)
+
+        # Draw interface after gesture updates so dragged items stay on top.
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, 0), (w, h), (9, 12, 18), -1)
+        frame = cv2.addWeighted(overlay, 0.62, frame, 0.38, 0)
+
+        draw_panel(frame, sidebar_x, sidebar_y, sidebar_w, sidebar_h, PANEL_BG, PANEL_STROKE, alpha=0.94, border_thickness=1)
+        draw_text(frame, "Handsome is cooking", (sidebar_x + 16, sidebar_y + 10), 20, TEXT_PRIMARY, bold=True)
+        draw_text(frame, "Slide staging demo", (sidebar_x + 16, sidebar_y + 34), 12, TEXT_MUTED, bold=False)
+
+        draw_panel(frame, sidebar_x + 12, sidebar_y + 66, sidebar_w - 24, 96, PANEL_BG_ALT, PANEL_STROKE, alpha=0.98, border_thickness=1)
+        draw_text(frame, "Session", (sidebar_x + 20, sidebar_y + 76), 14, TEXT_PRIMARY, bold=True)
+        draw_metric(frame, "Action", action_text, sidebar_x + 20, sidebar_y + 102)
+        draw_metric(frame, "Target", target_text, sidebar_x + 104, sidebar_y + 102)
+        draw_metric(frame, "FPS", f"{fps:.1f}", sidebar_x + 20, sidebar_y + 138)
+
+        draw_text(frame, "Slides", (sidebar_x + 16, sidebar_y + 170), 14, TEXT_MUTED, bold=True)
+        draw_zone(
+            frame,
+            presentation_zone,
+            cards,
+            hovered=presentation_zone.label == active_zone_label,
+            filled=presented_card is not None,
+        )
+        draw_text(frame, "Now Presenting", (presentation_zone.x + 12, presentation_zone.y - 28), 16, TEXT_PRIMARY, bold=True)
+        if current_time < drop_flash_until and presentation_zone.label == last_drop_zone_label:
+            cv2.rectangle(
+                frame,
+                (presentation_zone.x - 5, presentation_zone.y - 5),
+                (presentation_zone.x + presentation_zone.w + 5, presentation_zone.y + presentation_zone.h + 5),
+                SUCCESS,
+                5,
+            )
+            draw_text(frame, "Dropped!", (presentation_zone.x + 20, presentation_zone.y + 16), 14, SUCCESS, bold=True)
+
+        preview_card = dragged_card if dragged_card is not None else presented_card
+        if preview_card is not None:
+            draw_slide_preview(frame, preview_card, preview_zoom, presentation_zone)
+        elif hovered_card is None:
+            draw_text(frame, "Drop a slide here", (presentation_zone.x + 28, presentation_zone.y + 92), 18, TEXT_MUTED, bold=True)
+            draw_text(frame, "Hover a slide on the left and move it here", (presentation_zone.x + 28, presentation_zone.y + 122), 12, TEXT_MUTED, bold=False)
+
+        for card in visible_cards:
+            if card is not dragged_card:
+                draw_card(frame, card, active=False)
+                if presented_card is card:
+                    draw_presenting_outline(frame, card)
+
+        if hovered_card is not None and hovered_card is not dragged_card:
+            draw_hover_outline(frame, hovered_card)
+
+        if dragged_card is not None:
+            draw_card(frame, dragged_card, active=True)
+            cv2.rectangle(frame, (dragged_card.x - 6, dragged_card.y - 6), (dragged_card.x + dragged_card.w + 6, dragged_card.y + dragged_card.h + 6), ACCENT, 2)
+
+        completed = sum(1 for card in cards if card.placed_in is not None)
+        draw_panel(frame, sidebar_x + 12, sidebar_h + sidebar_y - 78, sidebar_w - 24, 62, PANEL_BG_ALT, PANEL_STROKE, alpha=0.98, border_thickness=1)
+        draw_text(frame, f"Slides  {loaded_slide_count}", (sidebar_x + 20, sidebar_h + sidebar_y - 70), 12, TEXT_MUTED, bold=False)
+        draw_text(frame, f"Slides on tray  {len(visible_cards)}", (sidebar_x + 20, sidebar_h + sidebar_y - 48), 12, TEXT_MUTED, bold=False)
+        draw_text(frame, f"Placed  {completed}/{len(cards)}", (sidebar_x + 110, sidebar_h + sidebar_y - 48), 12, SUCCESS, bold=True)
+
+        if cursor_point is not None:
+            if dragged_card is None and hovered_card is not None and hover_pickup_since is not None:
+                pickup_progress = (current_time - hover_pickup_since) / HOVER_PICKUP_SECONDS
+                draw_hover_progress(frame, cursor_point, 22, pickup_progress, (0, 255, 255))
+            elif dragged_card is not None and hovered_zone is not None and hover_drop_since is not None:
+                drop_progress = (current_time - hover_drop_since) / HOVER_DROP_SECONDS
+                draw_hover_progress(frame, cursor_point, 22, drop_progress, (120, 255, 180))
+
+        if hand_landmarks_to_draw is not None:
+            mp_draw.draw_landmarks(frame, hand_landmarks_to_draw, mp_hands.HAND_CONNECTIONS)
+
+        if show_start_screen:
+            draw_start_screen(frame, hand_found)
+
+        cv2.imshow(WINDOW_NAME, frame)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
+            break
+        if key == ord("f"):
+            fullscreen_enabled = not fullscreen_enabled
+            mode = cv2.WINDOW_FULLSCREEN if fullscreen_enabled else cv2.WINDOW_NORMAL
+            cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, mode)
+        if key == ord(" "):
+            show_start_screen = False
+        if key == 13:
+            if not show_start_screen and hovered_card is not None:
+                presented_card = hovered_card
+                presented_card.placed_in = presentation_zone.label
+                status_text = f"{presented_card.label} presented"
+                action_text = "Keyboard present"
+                target_text = presentation_zone.label
+                drop_flash_until = current_time + DROP_FLASH_SECONDS
+                last_drop_zone_label = presentation_zone.label
+        if key == ord("z"):
+            preview_zoom = min(1.35, preview_zoom + 0.05)
+        if key == ord("x"):
+            preview_zoom = max(0.75, preview_zoom - 0.05)
+        if key == ord("r"):
+            reset_cards(cards)
+            visible_cards = cards
+            update_card_layout(visible_cards, build_card_positions(len(visible_cards)))
+            dragged_card = None
+            presented_card = None
+            hovered_card = None
+            hover_pickup_since = None
+            hover_drop_since = None
+            status_text = "Cards reset"
+            action_text = "Reset"
+            target_text = "-"
+
+    cap.release()
+    cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
-    integrated_menu = IntegratedGestureMenu()
-    integrated_menu.run()
+    main()
